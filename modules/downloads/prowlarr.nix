@@ -16,7 +16,11 @@ in
       };
     };
 
-    users.groups.${user} = { };
+    users.groups.${group} = { };
+    users.users.${user} = {
+      isSystemUser = true;
+      inherit group;
+    };
 
     systemd.tmpfiles.rules = [ "d ${cfg.dataDir} 0750 ${user} ${group} - -" ];
 
