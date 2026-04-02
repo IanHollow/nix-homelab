@@ -92,11 +92,6 @@ in
 
         users.groups.${storage.group} = { };
         users.users.${user}.extraGroups = [ storage.group ];
-
-        homelab.vpn.inboundPorts = lib.mkIf (cfg.vpn.enable && cfg.vpn.allowInbound) {
-          tcp = [ cfg.torrentingPort ];
-          udp = [ cfg.torrentingPort ];
-        };
       };
     in
     mkIf cfg.enable (
@@ -108,6 +103,11 @@ in
               "${storage.downloadsDir}" = bindMount storage.downloadsDir;
             };
             config = qbittorrentConfig;
+          };
+
+          homelab.vpn.inboundPorts = lib.mkIf (cfg.vpn.enable && cfg.vpn.allowInbound) {
+            tcp = [ cfg.torrentingPort ];
+            udp = [ cfg.torrentingPort ];
           };
         }
       else
