@@ -1,269 +1,463 @@
 { lib, config, ... }:
 let
-  cfg = config.homelab.vpn;
+  inherit (lib)
+    mkEnableOption
+    mkIf
+    mkOption
+    mkDefault
+    types
+    optionals
+    optionalString
+    optionalAttrs
+    mkMerge
+    concatStringsSep
+    hasInfix
+    any
+    ;
 
-  useIPv4 = cfg.interface.addressIPv4 != null;
-  useIPv6 = cfg.interface.addressIPv6 != null;
+  cfg = config.homelab.vpnAppStack;
+
+  useTunnelIPv4 = cfg.interface.addressIPv4 != null;
+  useTunnelIPv6 = cfg.interface.addressIPv6 != null;
 
   family =
-    if useIPv4 && useIPv6 then
+    if useTunnelIPv4 && useTunnelIPv6 then
       "both"
-    else if useIPv4 then
+    else if useTunnelIPv4 then
       "ipv4"
-    else if useIPv6 then
+    else if useTunnelIPv6 then
       "ipv6"
     else
-      throw "homelab.vpn.interface.addressIPv4 and addressIPv6 cannot both be null";
+      throw "addressIPv4 and addressIPv6 cannot both be null";
+
+  useOuterIPv4 = cfg.container.hostAddressIPv4 != null && cfg.container.localAddressIPv4 != null;
+
+  useOuterIPv6 = cfg.container.hostAddressIPv6 != null && cfg.container.localAddressIPv6 != null;
+
+  endpointIsIPv6 = hasInfix ":" cfg.peer.endpointHost;
+
+  endpoint =
+    if endpointIsIPv6 then
+      "[${cfg.peer.endpointHost}]:${toString cfg.peer.endpointPort}"
+    else
+      "${cfg.peer.endpointHost}:${toString cfg.peer.endpointPort}";
 
   wgAddresses =
-    lib.optionals useIPv4 [ "${cfg.interface.addressIPv4}/32" ]
-    ++ lib.optionals useIPv6 [ "${cfg.interface.addressIPv6}/128" ];
+    optionals useTunnelIPv4 [ "${cfg.interface.addressIPv4}/32" ]
+    ++ optionals useTunnelIPv6 [ "${cfg.interface.addressIPv6}/128" ];
 
-  peerAllowedIPs = lib.optionals useIPv4 [ "0.0.0.0/0" ] ++ lib.optionals useIPv6 [ "::/0" ];
+  peerAllowedIPs = optionals useTunnelIPv4 [ "0.0.0.0/0" ] ++ optionals useTunnelIPv6 [ "::/0" ];
 
-  indexOf =
-    needle: haystack:
-    let
-      go =
-        idx: rest:
-        if rest == [ ] then
-          throw "User ${needle} not found in homelab.vpn.users"
-        else if builtins.head rest == needle then
-          idx
-        else
-          go (idx + 1) (builtins.tail rest);
-    in
-    go 0 haystack;
+  serviceListenAddress =
+    if useOuterIPv4 then cfg.container.localAddressIPv4 else cfg.container.localAddressIPv6;
 
-  mkUserRoutingRules =
-    user:
-    let
-      basePriority = 30000 + (indexOf user cfg.users * 10);
-    in
-    [
-      {
-        User = user;
-        Family = family;
-        Table = "main";
-        SuppressPrefixLength = 0;
-        Priority = basePriority;
-      }
-      {
-        User = user;
-        Family = family;
-        Table = cfg.table;
-        Priority = basePriority + 1;
-      }
-    ];
+  dnsHasIPv6 = any (s: hasInfix ":" s) cfg.interface.dns;
+  dnsHasIPv4 = any (s: !(hasInfix ":" s)) cfg.interface.dns;
 
-  renderSet = values: "{ ${lib.concatStringsSep ", " values} }";
+  webPorts =
+    optionals cfg.services.nzbget.enable [ cfg.services.nzbget.port ]
+    ++ optionals cfg.services.prowlarr.enable [ cfg.services.prowlarr.port ]
+    ++ optionals cfg.services.qbittorrent.enable [ cfg.services.qbittorrent.webuiPort ];
 
-  mkKillSwitchRules = user: ''
-    meta skuid ${user} oifname "${cfg.interface.name}" counter accept
-    ${lib.optionalString (useIPv4 && cfg.bypassIPv4Cidrs != [ ]) ''
-      meta skuid ${user} ip daddr ${renderSet cfg.bypassIPv4Cidrs} counter accept
-    ''}
-    ${lib.optionalString (useIPv6 && cfg.bypassIPv6Cidrs != [ ]) ''
-      meta skuid ${user} ip6 daddr ${renderSet cfg.bypassIPv6Cidrs} counter accept
-    ''}
-    meta skuid ${user} counter drop
-  '';
+  renderSet = values: "{ ${concatStringsSep ", " values} }";
+
+  commonServiceHardening = rwPaths: {
+    NoNewPrivileges = true;
+    PrivateTmp = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    ProtectControlGroups = true;
+    ProtectKernelModules = true;
+    ProtectKernelTunables = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    SystemCallArchitectures = "native";
+    UMask = "0007";
+    ReadWritePaths = rwPaths;
+  };
+
+  bindMount = hostPath: {
+    inherit hostPath;
+    isReadOnly = false;
+  };
 in
 {
-  options.homelab.vpn = {
-    enable = lib.mkEnableOption "route selected service users through WireGuard";
+  options.homelab.vpnAppStack = {
+    enable = mkEnableOption "containerized VPN-routed app stack for NZBGet, Prowlarr, and qBittorrent";
 
-    routeHostDnsViaVpn = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = ''
-        Route the host resolver's default DNS traffic over the WireGuard link
-        using systemd-resolved (Domains=~. + DNSDefaultRoute=true).
-
-        This is the simple, leak-resistant choice on a shared host, but it
-        affects DNS for the whole machine, not only homelab.vpn.users.
-      '';
-    };
-
-    persistentKeepalive = lib.mkOption {
-      type = lib.types.ints.between 0 65535;
-      default = 25;
-      description = "WireGuard PersistentKeepalive in seconds; 0 disables it.";
-    };
-
-    table = lib.mkOption {
-      type = lib.types.ints.between 1 4294967295;
-      default = 51820;
-      description = "Dedicated routing table for VPN-routed services.";
-    };
-
-    users = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Usernames whose traffic should be routed through the VPN.";
-    };
-
-    interface.name = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
+    uplinkInterface = mkOption {
+      type = types.nullOr types.str;
       default = null;
-      description = "WireGuard interface name.";
+      description = "Host interface that reaches the Internet before the VPN tunnel is up.";
+      example = "enp3s0";
     };
 
-    interface.privateKeyFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Absolute path to the WireGuard private key file.";
+    container = {
+      name = mkOption {
+        type = types.str;
+        default = "vpn-media";
+      };
+
+      hostAddressIPv4 = mkOption {
+        type = types.nullOr types.str;
+        default = "10.231.0.1";
+      };
+
+      localAddressIPv4 = mkOption {
+        type = types.nullOr types.str;
+        default = "10.231.0.2";
+      };
+
+      hostAddressIPv6 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+      };
+
+      localAddressIPv6 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+      };
     };
 
-    interface.addressIPv4 = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Local WireGuard IPv4 address, without prefix length.";
+    interface = {
+      name = mkOption {
+        type = types.str;
+        default = "wg0";
+        description = "Name of the WireGuard interface to create on the host.";
+      };
+
+      privateKeyFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Absolute path to the WireGuard private key file on the host; it will be bind-mounted read-only into the container.";
+      };
+
+      addressIPv4 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Tunnel IPv4 address without prefix length.";
+      };
+
+      addressIPv6 = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Tunnel IPv6 address without prefix length.";
+      };
+
+      dns = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "DNS servers that must be reachable through the WireGuard tunnel.";
+      };
+
+      mtu = mkOption {
+        type = types.nullOr (types.ints.between 1280 65535);
+        default = null;
+      };
     };
 
-    interface.addressIPv6 = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Local WireGuard IPv6 address, without prefix length.";
+    peer = {
+      publicKey = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+      };
+
+      endpointHost = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+      };
+
+      endpointPort = mkOption {
+        type = types.port;
+        default = 51820;
+      };
+
+      persistentKeepalive = mkOption {
+        type = types.ints;
+        default = 25;
+        description = "WireGuard PersistentKeepalive in seconds; 0 disables it.";
+      };
     };
 
-    interface.dns = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "DNS servers reachable over the WireGuard tunnel.";
-    };
-
-    peer.publicKey = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "WireGuard peer public key.";
-    };
-
-    peer.endpoint = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = ''
-        Peer endpoint in host:port or IP:port form.
-
-        If routeHostDnsViaVpn = true, prefer a literal IP endpoint so that
-        tunnel DNS does not have to resolve the endpoint hostname.
-      '';
-    };
-
-    bypassIPv4Cidrs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [
-        "127.0.0.0/8"
-        "169.254.0.0/16"
-      ];
-      description = ''
-        IPv4 destinations allowed to bypass the VPN for homelab.vpn.users.
-        Keep this minimal. Add your exact LAN prefix only if you intentionally
-        want cleartext LAN access.
-      '';
-    };
-
-    bypassIPv6Cidrs = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [
-        "::1/128"
-        "fe80::/10"
-      ];
-      description = ''
-        IPv6 destinations allowed to bypass the VPN for homelab.vpn.users.
-        Keep this minimal. Add your exact ULA/LAN prefix only if you intentionally
-        want cleartext LAN access.
-      '';
+    storage = {
+      downloadsDir = mkOption {
+        type = types.str;
+        default = "/srv/media/downloads";
+      };
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.interface.name != null;
-        message = "homelab.vpn.interface.name must be set when homelab.vpn.enable = true";
+        assertion = cfg.uplinkInterface != null;
+        message = "homelab.vpnAppStack.uplinkInterface must be set to the host interface that reaches the Internet before the VPN tunnel is up.";
+      }
+      {
+        assertion = useTunnelIPv4 || useTunnelIPv6;
+        message = "At least one of homelab.vpnAppStack.interface.addressIPv4/addressIPv6 must be set.";
+      }
+      {
+        assertion = useOuterIPv4 || useOuterIPv6;
+        message = "At least one container veth family must be configured.";
+      }
+      {
+        assertion = !(useTunnelIPv4 && !useTunnelIPv6 && dnsHasIPv6);
+        message = "Tunnel is IPv4-only, so do not configure IPv6 DNS servers.";
+      }
+      {
+        assertion = !(useTunnelIPv6 && !useTunnelIPv4 && dnsHasIPv4);
+        message = "Tunnel is IPv6-only, so do not configure IPv4 DNS servers.";
+      }
+      {
+        assertion = !endpointIsIPv6 || useOuterIPv6;
+        message = "WireGuard endpointHost is IPv6, but container.hostAddressIPv6/localAddressIPv6 are not configured.";
+      }
+      {
+        assertion = endpointIsIPv6 || useOuterIPv4;
+        message = "WireGuard endpointHost is IPv4, but container.hostAddressIPv4/localAddressIPv4 are not configured.";
       }
       {
         assertion = cfg.interface.privateKeyFile != null;
-        message = "homelab.vpn.interface.privateKeyFile must be set when homelab.vpn.enable = true";
+        message = "homelab.vpnAppStack.interface.privateKeyFile must be set to the absolute path of the WireGuard private key file on the host.";
       }
       {
-        assertion = useIPv4 || useIPv6;
-        message = "At least one of homelab.vpn.interface.addressIPv4/addressIPv6 must be set";
-      }
-      {
-        assertion = cfg.peer.publicKey != null;
-        message = "homelab.vpn.peer.publicKey must be set when homelab.vpn.enable = true";
-      }
-      {
-        assertion = cfg.peer.endpoint != null;
-        message = "homelab.vpn.peer.endpoint must be set when homelab.vpn.enable = true";
-      }
-      {
-        assertion = (!cfg.routeHostDnsViaVpn) || (cfg.interface.dns != [ ]);
-        message = "homelab.vpn.interface.dns must be non-empty when routeHostDnsViaVpn = true";
+        assertion = cfg.interface.dns != [ ];
+        message = "homelab.vpnAppStack.interface.dns must be non-empty.";
       }
     ];
 
-    systemd.network.enable = true;
-    services.resolved.enable = lib.mkDefault true;
+    boot.enableContainers = true;
+    virtualisation.containers.enable = true;
 
-    networking.firewall.checkReversePath = lib.mkDefault "loose";
-    networking.nftables.enable = true;
-
-    systemd.network.config.routeTables.wg-services = cfg.table;
-
-    systemd.network.netdevs."50-${cfg.interface.name}" = {
-      netdevConfig = {
-        Name = cfg.interface.name;
-        Kind = "wireguard";
-      };
-
-      wireguardConfig = {
-        PrivateKeyFile = cfg.interface.privateKeyFile;
-      };
-
-      wireguardPeers = [
-        {
-          PublicKey = cfg.peer.publicKey;
-          Endpoint = cfg.peer.endpoint;
-          AllowedIPs = peerAllowedIPs;
-          RouteTable = cfg.table;
-          PersistentKeepalive = cfg.persistentKeepalive;
-        }
-      ];
+    networking.nat = {
+      enable = true;
+      internalInterfaces = lib.mkAfter [ "ve-${cfg.container.name}" ];
+      externalInterface = mkDefault cfg.uplinkInterface;
+      enableIPv6 = mkDefault useOuterIPv6;
     };
 
-    systemd.network.networks."50-${cfg.interface.name}" = {
-      matchConfig.Name = cfg.interface.name;
+    # Persistent host-side directories for bind mounts.
+    systemd.tmpfiles.rules = [
+      "d ${cfg.storage.downloadsDir} 0750 root root - -"
+    ]
+    ++ optionals config.services.nzbget.enable [
+      "d ${config.services.nzbget.dataDir} 0750 root root - -"
+    ]
+    ++ optionals config.services.prowlarr.enable [
+      "d ${config.services.prowlarr.dataDir} 0750 root root - -"
+    ]
+    ++ optionals config.services.qbittorrent.enable [
+      "d ${config.services.qbittorrent.profileDir} 0750 root root - -"
+    ];
 
-      address = wgAddresses;
+    containers.${cfg.container.name} = {
+      autoStart = true;
+      privateNetwork = true;
 
-      # Avoid boot being considered "offline" if the tunnel is not up yet.
-      linkConfig.RequiredForOnline = false;
+      hostAddress = mkIf useOuterIPv4 cfg.container.hostAddressIPv4;
+      localAddress = mkIf useOuterIPv4 cfg.container.localAddressIPv4;
+      hostAddress6 = mkIf useOuterIPv6 cfg.container.hostAddressIPv6;
+      localAddress6 = mkIf useOuterIPv6 cfg.container.localAddressIPv6;
 
-      dns = lib.optionals cfg.routeHostDnsViaVpn cfg.interface.dns;
-      domains = lib.optionals cfg.routeHostDnsViaVpn [ "~." ];
+      bindMounts = {
+        "${cfg.interface.privateKeyFile}" = {
+          hostPath = cfg.interface.privateKeyFile;
+          isReadOnly = true;
+        };
 
-      networkConfig = {
-        ConfigureWithoutCarrier = true;
-        IgnoreCarrierLoss = true;
+        "${cfg.storage.downloadsDir}" = bindMount cfg.storage.downloadsDir;
       }
-      // lib.optionalAttrs cfg.routeHostDnsViaVpn { DNSDefaultRoute = true; };
+      // optionalAttrs config.services.nzbget.enable { "/var/lib/nzbget" = bindMount "/var/lib/nzbget"; }
+      // optionalAttrs config.services.prowlarr.enable {
+        "${config.services.prowlarr.dataDir}" = bindMount config.services.prowlarr.dataDir;
+      }
+      // optionalAttrs config.services.qbittorrent.enable {
+        "${config.services.qbittorrent.profileDir}" = bindMount config.services.qbittorrent.profileDir;
+      };
 
-      routingPolicyRules = lib.concatMap mkUserRoutingRules cfg.users;
-    };
+      config =
+        let
+          mainConfig = config;
+        in
+        { lib, config, ... }:
+        {
+          system.stateVersion = mainConfig.system.stateVersion;
 
-    networking.nftables.tables.vpn-services = {
-      family = "inet";
-      content = ''
-        chain output_filter {
-          type filter hook output priority filter;
-          policy accept;
+          networking.useHostResolvConf = false;
+          networking.nameservers = cfg.interface.dns;
+          networking.enableIPv6 = useTunnelIPv6 || useOuterIPv6;
 
-          ${lib.concatStringsSep "\n          " (map mkKillSwitchRules cfg.users)}
-        }
-      '';
+          networking.defaultGateway = mkIf useOuterIPv4 cfg.container.hostAddressIPv4;
+          networking.defaultGateway6 = mkIf useOuterIPv6 {
+            address = cfg.container.hostAddressIPv6;
+            interface = "eth0";
+          };
+
+          networking.nftables.enable = true;
+          networking.firewall.enable = false;
+
+          systemd.network.enable = true;
+          services.resolved.enable = false;
+
+          systemd.network.config.routeTables.vpnapps = 51820;
+
+          systemd.network.netdevs."50-${cfg.interface.name}" = {
+            netdevConfig = {
+              Name = cfg.interface.name;
+              Kind = "wireguard";
+            }
+            // optionalAttrs (cfg.interface.mtu != null) { MTUBytes = cfg.interface.mtu; };
+
+            wireguardConfig = {
+              PrivateKeyFile = cfg.interface.privateKeyFile;
+              FirewallMark = 51820;
+            };
+
+            wireguardPeers = [
+              {
+                PublicKey = cfg.peer.publicKey;
+                Endpoint = endpoint;
+                AllowedIPs = peerAllowedIPs;
+                RouteTable = 51820;
+                PersistentKeepalive = cfg.persistentKeepalive;
+              }
+            ];
+          };
+
+          systemd.network.networks."50-${cfg.interface.name}" = {
+            matchConfig.Name = cfg.interface.name;
+            address = wgAddresses;
+
+            linkConfig.RequiredForOnline = false;
+
+            networkConfig = {
+              ConfigureWithoutCarrier = true;
+              IgnoreCarrierLoss = true;
+            };
+
+            routingPolicyRules = [
+              {
+                Family = family;
+                Table = "main";
+                SuppressPrefixLength = 0;
+                Priority = 10000;
+              }
+              {
+                Family = family;
+                FirewallMark = 51820;
+                InvertRule = true;
+                Table = 51820;
+                Priority = 10001;
+              }
+            ];
+          };
+
+          networking.nftables.tables.vpn-killswitch = {
+            family = "inet";
+            content = ''
+              chain input {
+                type filter hook input priority filter; policy drop;
+
+                iifname "lo" accept
+                ct state established,related accept
+
+                ${optionalString (useOuterIPv4 && webPorts != [ ]) ''
+                  iifname "eth0" ip saddr ${cfg.container.hostAddressIPv4} tcp dport ${renderSet (map toString webPorts)} accept
+                ''}
+                ${optionalString (useOuterIPv6 && webPorts != [ ]) ''
+                  iifname "eth0" ip6 saddr ${cfg.container.hostAddressIPv6} tcp dport ${renderSet (map toString webPorts)} accept
+                ''}
+              }
+
+              chain output {
+                type filter hook output priority filter; policy drop;
+
+                oifname "lo" accept
+                ct state established,related accept
+
+                # Allow only the outer WireGuard handshake to escape on eth0.
+                ${
+                  if endpointIsIPv6 then
+                    ''
+                      oifname "eth0" ip6 daddr ${cfg.peer.endpointHost} udp dport ${toString cfg.peer.endpointPort} accept
+                    ''
+                  else
+                    ''
+                      oifname "eth0" ip daddr ${cfg.peer.endpointHost} udp dport ${toString cfg.peer.endpointPort} accept
+                    ''
+                }
+
+                # Everything else must go through the tunnel.
+                oifname "${cfg.interface.name}" accept
+              }
+            '';
+          };
+
+          services.nzbget = mkIf config.services.nzbget.enable {
+            enable = true;
+            settings = {
+              ControlIP = serviceListenAddress;
+            };
+          };
+
+          services.prowlarr = mkIf config.services.prowlarr.enable {
+            enable = true;
+            settings.server = {
+              bindaddress = serviceListenAddress;
+            };
+          };
+
+          services.qbittorrent = mkIf config.services.qbittorrent.enable {
+            enable = true;
+            webuiPort = 8081;
+            torrentingPort = 51413;
+            serverConfig.Preferences.WebUI = {
+              Address = serviceListenAddress;
+              ReverseProxySupportEnabled = true;
+            };
+          };
+
+          users.groups = mkMerge [
+            (optionalAttrs config.services.nzbget.enable { "${config.services.nzbget.group}" = { }; })
+            (optionalAttrs config.services.prowlarr.enable { prowlarr = { }; })
+            (optionalAttrs config.services.qbittorrent.enable { "${config.services.qbittorrent.group}" = { }; })
+          ];
+
+          users.users = mkMerge [
+            (optionalAttrs config.services.prowlarr.enable {
+              prowlarr = {
+                isSystemUser = true;
+                group = "prowlarr";
+              };
+            })
+          ];
+
+          systemd.services = mkMerge [
+            (mkIf config.services.nzbget.enable {
+              nzbget.serviceConfig = commonServiceHardening [
+                "/var/lib/nzbget"
+                cfg.storage.downloadsDir
+              ];
+            })
+
+            (mkIf config.services.prowlarr.enable {
+              prowlarr.serviceConfig = (commonServiceHardening [ config.services.prowlarr.dataDir ]) // {
+                DynamicUser = lib.mkForce false;
+                User = lib.mkForce "prowlarr";
+                Group = lib.mkForce "prowlarr";
+              };
+            })
+
+            (mkIf config.services.qbittorrent.enable {
+              qbittorrent.serviceConfig = commonServiceHardening [
+                config.services.qbittorrent.profileDir
+                cfg.storage.downloadsDir
+              ];
+            })
+          ];
+        };
     };
   };
 }
