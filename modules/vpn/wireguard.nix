@@ -1,4 +1,9 @@
-{ lib, config, ... }:
+{
+  lib,
+  config,
+  pkgs,
+  ...
+}:
 let
   inherit (lib)
     any
@@ -304,7 +309,6 @@ in
         system.stateVersion = config.system.stateVersion;
 
         networking.useHostResolvConf = false;
-        networking.nameservers = cfg.interface.dns;
         networking.enableIPv6 = useTunnelIPv6 || useOuterIPv6;
 
         networking.defaultGateway = mkIf useOuterIPv4 cfg.container.hostAddressIPv4;
@@ -319,7 +323,29 @@ in
         boot.kernel.sysctl."net.ipv4.conf.all.src_valid_mark" = 1;
 
         systemd.network.enable = true;
-        services.resolved.enable = false;
+        services.resolved.enable = true;
+
+        systemd.services.vpn-ready = {
+          description = "Wait for ${cfg.interface.name} VPN readiness";
+          after = [ "systemd-networkd.service" ];
+          requires = [ "systemd-networkd.service" ];
+          wantedBy = [ "multi-user.target" ];
+          serviceConfig = {
+            Type = "oneshot";
+          };
+          script = ''
+            set -eu
+            ${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --interface=${cfg.interface.name} --timeout=30
+            ${optionalString useTunnelIPv4 ''
+              route_line_v4="$(${pkgs.iproute2}/bin/ip -o -4 route show table 51820 default dev ${cfg.interface.name})"
+              [ -n "$route_line_v4" ]
+            ''}
+            ${optionalString useTunnelIPv6 ''
+              route_line_v6="$(${pkgs.iproute2}/bin/ip -o -6 route show table 51820 default dev ${cfg.interface.name})"
+              [ -n "$route_line_v6" ]
+            ''}
+          '';
+        };
 
         systemd.network.config.routeTables.vpnapps = 51820;
 
@@ -356,12 +382,13 @@ in
         systemd.network.networks."50-${cfg.interface.name}" = {
           matchConfig.Name = cfg.interface.name;
           address = wgAddresses;
-
-          linkConfig.RequiredForOnline = false;
+          inherit (cfg.interface) dns;
+          domains = [ "~." ];
 
           networkConfig = {
             ConfigureWithoutCarrier = true;
             IgnoreCarrierLoss = true;
+            DNSDefaultRoute = true;
           };
 
           routingPolicyRules = [

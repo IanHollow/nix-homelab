@@ -37,6 +37,6 @@ in
 
     users.groups.${cfg.group} = { };
 
-    systemd.tmpfiles.rules = [ "d ${cfg.downloadsDir} 0770 root ${cfg.group} - -" ];
+    systemd.tmpfiles.rules = [ "d ${cfg.downloadsDir} 2770 root ${cfg.group} - -" ];
   };
 }

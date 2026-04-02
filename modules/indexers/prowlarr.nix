@@ -8,7 +8,6 @@ let
     ;
 
   cfg = config.homelab.services.prowlarr;
-  inherit (config.homelab) storage;
 
   user = "prowlarr";
   group = "prowlarr";
@@ -50,38 +49,49 @@ in
         users.users.${user} = {
           isSystemUser = true;
           inherit group;
-          extraGroups = lib.mkIf config.homelab.storage.enable [ config.homelab.storage.group ];
         };
 
-        systemd.services.prowlarr.serviceConfig = {
-          DynamicUser = lib.mkForce false;
-          User = lib.mkForce user;
-          Group = lib.mkForce group;
-          NoNewPrivileges = true;
-          PrivateTmp = true;
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          ProtectControlGroups = true;
-          ProtectKernelModules = true;
-          ProtectKernelTunables = true;
-          RestrictRealtime = true;
-          RestrictSUIDSGID = true;
-          RestrictNamespaces = true;
-          LockPersonality = true;
-          ProtectProc = "invisible";
-          ProcSubset = "pid";
-          CapabilityBoundingSet = "";
-          AmbientCapabilities = [ ];
-          SystemCallArchitectures = "native";
-          UMask = "0007";
-          ReadWritePaths = [ config.services.prowlarr.dataDir ];
+        systemd.services.prowlarr = {
+          after = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          requires = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          serviceConfig = {
+            DynamicUser = lib.mkForce false;
+            User = lib.mkForce user;
+            Group = lib.mkForce group;
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            PrivateDevices = true;
+            DevicePolicy = "closed";
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            ProtectControlGroups = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectKernelLogs = true;
+            ProtectClock = true;
+            ProtectHostname = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            RestrictNamespaces = true;
+            LockPersonality = true;
+            ProtectProc = "invisible";
+            ProcSubset = "pid";
+            CapabilityBoundingSet = "";
+            AmbientCapabilities = [ ];
+            RestrictAddressFamilies = [
+              "AF_UNIX"
+              "AF_INET"
+            ]
+            ++ lib.optionals config.networking.enableIPv6 [ "AF_INET6" ];
+            SystemCallArchitectures = "native";
+            SystemCallFilter = [ "@system-service" ];
+            SystemCallErrorNumber = "EPERM";
+            UMask = "0007";
+            ReadWritePaths = [ config.services.prowlarr.dataDir ];
+          };
         };
 
-        systemd.tmpfiles.rules =
-          if cfg.vpn.enable then
-            [ "d ${config.services.prowlarr.dataDir} 0770 root ${storage.group} - -" ]
-          else
-            [ "d ${config.services.prowlarr.dataDir} 0750 ${user} ${group} - -" ];
+        systemd.tmpfiles.rules = [ "d ${config.services.prowlarr.dataDir} 0750 ${user} ${group} - -" ];
       };
     in
     mkIf cfg.enable (
@@ -90,7 +100,6 @@ in
           containers.${config.homelab.vpn.container.name} = {
             bindMounts = {
               "${config.services.prowlarr.dataDir}" = bindMount config.services.prowlarr.dataDir;
-              "${storage.downloadsDir}" = bindMount storage.downloadsDir;
             };
             config = prowlarrConfig;
           };

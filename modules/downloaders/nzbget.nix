@@ -51,35 +51,47 @@ in
           };
         };
 
-        systemd.services.nzbget.serviceConfig = {
-          UMask = lib.mkForce "0007";
-          NoNewPrivileges = true;
-          PrivateTmp = true;
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          ProtectControlGroups = true;
-          ProtectKernelModules = true;
-          ProtectKernelTunables = true;
-          RestrictRealtime = true;
-          RestrictSUIDSGID = true;
-          RestrictNamespaces = true;
-          LockPersonality = true;
-          ProtectProc = "invisible";
-          ProcSubset = "pid";
-          CapabilityBoundingSet = "";
-          AmbientCapabilities = [ ];
-          SystemCallArchitectures = "native";
-          ReadWritePaths = [
-            dataDir
-            storage.downloadsDir
-          ];
+        systemd.services.nzbget = {
+          after = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          requires = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          serviceConfig = {
+            UMask = lib.mkForce "0007";
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            PrivateDevices = true;
+            DevicePolicy = "closed";
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            ProtectControlGroups = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectKernelLogs = true;
+            ProtectClock = true;
+            ProtectHostname = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            RestrictNamespaces = true;
+            LockPersonality = true;
+            ProtectProc = "invisible";
+            ProcSubset = "pid";
+            CapabilityBoundingSet = "";
+            AmbientCapabilities = [ ];
+            RestrictAddressFamilies = [
+              "AF_UNIX"
+              "AF_INET"
+            ]
+            ++ lib.optionals config.networking.enableIPv6 [ "AF_INET6" ];
+            SystemCallArchitectures = "native";
+            SystemCallFilter = [ "@system-service" ];
+            SystemCallErrorNumber = "EPERM";
+            ReadWritePaths = [
+              dataDir
+              storage.downloadsDir
+            ];
+          };
         };
 
-        systemd.tmpfiles.rules =
-          if cfg.vpn.enable then
-            [ "d ${dataDir} 0770 root ${storage.group} - -" ]
-          else
-            [ "d ${dataDir} 0750 ${user} ${group} - -" ];
+        systemd.tmpfiles.rules = [ "d ${dataDir} 0750 ${user} ${group} - -" ];
 
         users.groups.${storage.group} = { };
         users.users.${user}.extraGroups = [ storage.group ];
