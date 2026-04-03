@@ -4,6 +4,7 @@
     system = "aarch64-linux";
     specialArgs = { inherit inputs; };
     modules = [
+      inputs.agenix.nixosModules.default
       ../../hosts/vm-test-vpn/default.nix
     ];
   };

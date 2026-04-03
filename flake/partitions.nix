@@ -7,6 +7,7 @@
     checks = "dev";
     devShells = "dev";
     formatter = "dev";
+    nixosConfigurations = "dev";
   };
 
   partitions = {

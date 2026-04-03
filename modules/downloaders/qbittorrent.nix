@@ -72,7 +72,7 @@ in
             PrivateDevices = true;
             DevicePolicy = "closed";
             ProtectSystem = lib.mkForce "strict";
-            ProtectHome = true;
+            ProtectHome = lib.mkForce "yes";
             ProtectControlGroups = true;
             ProtectKernelModules = true;
             ProtectKernelTunables = true;

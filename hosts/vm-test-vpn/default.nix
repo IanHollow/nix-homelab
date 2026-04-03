@@ -1,9 +1,4 @@
-{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
+{ config, pkgs, ... }:
 {
   imports = [ ../../modules ];
 
@@ -16,11 +11,22 @@
     isNormalUser = true;
     initialPassword = "tester";
     extraGroups = [ "wheel" ];
+    openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC4EqEGMCbdAeSwbmcjzSHtpuhUPOAp+IjOjNaGlhC4v"
+    ];
   };
 
   services.openssh = {
     enable = true;
     settings.PasswordAuthentication = true;
+  };
+
+  age.identityPaths = [ "/var/lib/agenix-identity/home-server-vm" ];
+  age.secrets.homelab-vpn-privatekey = {
+    file = ../../secrets/homelab-vpn-privatekey.age;
+    owner = "root";
+    group = "root";
+    mode = "0400";
   };
 
   homelab.storage.enable = true;
@@ -30,14 +36,15 @@
     uplinkInterface = "eth0";
 
     interface = {
-      privateKeyFile = "/run/secrets/homelab-vpn-privatekey";
-      addressIPv4 = "10.64.0.2";
-      dns = [ "1.1.1.1" ];
+      privateKeyFile = config.age.secrets.homelab-vpn-privatekey.path;
+      addressIPv4 = "10.71.216.231";
+      addressIPv6 = "fc00:bbbb:bbbb:bb01::8:d8e6";
+      dns = [ "10.64.0.1" ];
     };
 
     peer = {
-      publicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-      endpointHost = "198.51.100.1";
+      publicKey = "bZQF7VRDRK/JUJ8L6EFzF/zRw2tsqMRk6FesGtTgsC0=";
+      endpointHost = "138.199.43.91";
       endpointPort = 51820;
       persistentKeepalive = 25;
     };
@@ -57,11 +64,6 @@
     enable = true;
     vpn.enable = true;
   };
-
-  systemd.tmpfiles.rules = [
-    "d /run/secrets 0755 root root - -"
-    "f /run/secrets/homelab-vpn-privatekey 0600 root root - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-  ];
 
   virtualisation.vmVariant = {
     virtualisation = {
@@ -83,8 +85,11 @@
         }
       ];
 
-      useNixStoreImage = lib.mkDefault false;
-      useBootLoader = lib.mkDefault false;
+      sharedDirectories.host-secrets = {
+        source = ''"''${VM_AGE_IDENTITY_DIR:?set VM_AGE_IDENTITY_DIR}"'';
+        target = "/var/lib/agenix-identity";
+        securityModel = "none";
+      };
     };
 
     networking.firewall.allowedTCPPorts = [ 22 ];
