@@ -62,57 +62,52 @@ in
         };
 
         systemd.services.qbittorrent = {
-          after = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
-          requires = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
+          after = lib.mkIf cfg.vpn.enable [ "vpnns.service" ];
+          requires = lib.mkIf cfg.vpn.enable [ "vpnns.service" ];
           bindsTo = lib.mkIf cfg.vpn.enable [ "vpnns-anchor.service" ];
-          serviceConfig = {
-            UMask = lib.mkForce "0007";
-            NoNewPrivileges = true;
-            PrivateTmp = lib.mkForce true;
-            PrivateDevices = true;
-            DevicePolicy = "closed";
-            ProtectSystem = lib.mkForce "strict";
-            ProtectHome = lib.mkForce "yes";
-            ProtectControlGroups = true;
-            ProtectKernelModules = true;
-            ProtectKernelTunables = true;
-            ProtectKernelLogs = true;
-            ProtectClock = true;
-            ProtectHostname = true;
-            RestrictRealtime = true;
-            RestrictSUIDSGID = true;
-            RestrictNamespaces = true;
-            LockPersonality = true;
-            ProtectProc = "invisible";
-            ProcSubset = "pid";
-            CapabilityBoundingSet = "";
-            AmbientCapabilities = [ ];
-            RestrictAddressFamilies = [
-              "AF_UNIX"
-              "AF_INET"
-            ]
-            ++ lib.optionals config.networking.enableIPv6 [ "AF_INET6" ];
-            SystemCallArchitectures = "native";
-            SystemCallFilter = [ "@system-service" ];
-            SystemCallErrorNumber = "EPERM";
-            ReadWritePaths = [
+          unitConfig = {
+            RequiresMountsFor = [
               config.services.qbittorrent.profileDir
               storage.downloadsDir
-            ];
-            PrivateUsers = true;
-            MemoryDenyWriteExecute = true;
-          }
-          // lib.optionalAttrs cfg.vpn.enable {
-            NetworkNamespacePath = config.homelab.vpn.namespace.path;
-            BindReadOnlyPaths = [ "${config.homelab.vpn.namespace.resolvConfPath}:/etc/resolv.conf" ];
+            ]
+            ++ lib.optionals cfg.vpn.enable [ config.homelab.vpn.namespace.resolvConfPath ];
+            JoinsNamespaceOf = lib.mkIf cfg.vpn.enable [ "vpnns-anchor.service" ];
           };
+          serviceConfig =
+            config.homelab.vpn.namespace.serviceHardening
+            // {
+              UMask = lib.mkForce "0007";
+              NoNewPrivileges = lib.mkForce true;
+              PrivateTmp = lib.mkForce true;
+              PrivateDevices = lib.mkForce true;
+              ProtectSystem = lib.mkForce "strict";
+              ProtectHome = lib.mkForce true;
+              RestrictAddressFamilies =
+                if cfg.vpn.enable then
+                  config.homelab.vpn.namespace.serviceHardening.RestrictAddressFamilies
+                else
+                  [
+                    "AF_UNIX"
+                    "AF_INET"
+                  ]
+                  ++ lib.optionals config.networking.enableIPv6 [ "AF_INET6" ];
+              ReadWritePaths = [
+                config.services.qbittorrent.profileDir
+                storage.downloadsDir
+              ];
+              PrivateUsers = true;
+              MemoryDenyWriteExecute = true;
+            }
+            // lib.optionalAttrs cfg.vpn.enable {
+              PrivateNetwork = lib.mkForce true;
+              BindReadOnlyPaths = [ "${config.homelab.vpn.namespace.resolvConfPath}:/etc/resolv.conf" ];
+            };
         };
 
         systemd.tmpfiles.rules = [
           "d ${config.services.qbittorrent.profileDir} 0750 ${user} ${group} - -"
         ];
 
-        users.groups.${storage.group} = { };
         users.users.${user}.extraGroups = [ storage.group ];
       };
     in

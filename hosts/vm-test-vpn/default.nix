@@ -33,8 +33,6 @@
 
   homelab.vpn = {
     enable = true;
-    uplinkInterface = "eth0";
-
     interface = {
       privateKeyFile = config.age.secrets.homelab-vpn-privatekey.path;
       addressIPv4 = "10.71.216.231";
@@ -64,6 +62,19 @@
     enable = true;
     vpn.enable = true;
   };
+
+  environment.systemPackages = with pkgs; [
+    bind
+    curl
+    iproute2
+    iputils
+    jq
+    netcat-openbsd
+    nftables
+    procps
+    tcpdump
+    wireguard-tools
+  ];
 
   virtualisation.vmVariant = {
     virtualisation = {

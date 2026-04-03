@@ -1,10 +1,6 @@
 {
   perSystem =
-    {
-      pkgs,
-      inputs',
-      ...
-    }:
+    { pkgs, inputs', ... }:
     {
       devShells.default = pkgs.mkShellNoCC {
         packages = with pkgs; [

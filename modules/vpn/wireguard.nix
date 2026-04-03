@@ -80,6 +80,38 @@ let
       "${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} -6 route replace default dev ${cfg.interface.name}"
     ];
 
+  serviceHardening = {
+    NoNewPrivileges = true;
+    PrivateTmp = true;
+    PrivateDevices = true;
+    DevicePolicy = "closed";
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    ProtectControlGroups = true;
+    ProtectKernelModules = true;
+    ProtectKernelTunables = true;
+    ProtectKernelLogs = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    RestrictNamespaces = true;
+    LockPersonality = true;
+    ProtectProc = "invisible";
+    ProcSubset = "pid";
+    CapabilityBoundingSet = "";
+    AmbientCapabilities = [ ];
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_INET"
+    ]
+    ++ optionals useTunnelIPv6 [ "AF_INET6" ];
+    SystemCallArchitectures = "native";
+    SystemCallFilter = [ "@system-service" ];
+    SystemCallErrorNumber = "EPERM";
+    UMask = "0007";
+  };
+
   nftNamespaceRules = ''
     flush ruleset
 
@@ -105,6 +137,10 @@ let
         ) "iifname \"${cfg.interface.name}\" udp dport ${renderSet (map toString inboundUdp)} accept"}
       }
 
+      chain forward {
+        type filter hook forward priority filter; policy drop;
+      }
+
       chain output {
         type filter hook output priority filter; policy drop;
 
@@ -119,19 +155,6 @@ in
 {
   options.homelab.vpn = {
     enable = mkEnableOption "shared netns VPN-routed app stack for selected apps";
-
-    uplinkInterface = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "enp3s0";
-    };
-
-    container.bindAddress = mkOption {
-      type = types.str;
-      default = config.homelab.vpn.namespace.bindAddress;
-      readOnly = true;
-      description = "Compatibility alias to homelab.vpn.namespace.bindAddress.";
-    };
 
     namespace = {
       name = mkOption {
@@ -154,6 +177,12 @@ in
       resolvConfPath = mkOption {
         type = types.str;
         default = "/run/vpnns/resolv.conf";
+      };
+
+      serviceHardening = mkOption {
+        type = types.attrsOf types.anything;
+        default = serviceHardening;
+        readOnly = true;
       };
 
       veth = {
@@ -270,10 +299,6 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.uplinkInterface != null;
-        message = "homelab.vpn.uplinkInterface must be set.";
-      }
-      {
         assertion = useTunnelIPv4 || useTunnelIPv6;
         message = "At least one of homelab.vpn.interface.addressIPv4/addressIPv6 must be set.";
       }
@@ -313,18 +338,18 @@ in
         assertion = cfg.interface.dns != [ ];
         message = "homelab.vpn.interface.dns must be non-empty.";
       }
+      {
+        assertion = hasPrefix "/" cfg.namespace.resolvConfPath;
+        message = "homelab.vpn.namespace.resolvConfPath must be an absolute path.";
+      }
     ];
 
     systemd.tmpfiles.rules =
       optionals (cfg.interface.privateKeyFile != null) [
-        "z ${cfg.interface.privateKeyFile} 0640 root root - -"
+        "z ${cfg.interface.privateKeyFile} 0600 root root - -"
       ]
       ++ optionals (cfg.peer.presharedKeyFile != null) [
-        "z ${cfg.peer.presharedKeyFile} 0640 root root - -"
-      ]
-      ++ [
-        "d /run/netns 0755 root root - -"
-        "d /run/vpnns 0755 root root - -"
+        "z ${cfg.peer.presharedKeyFile} 0600 root root - -"
       ];
 
     systemd.services.vpnns-anchor = {
@@ -337,17 +362,28 @@ in
       };
     };
 
-    systemd.services.vpnns-attach = {
-      description = "Attach anchor namespace to /run/netns";
+    systemd.services.vpnns = {
+      description = "Configure VPN namespace, WireGuard, resolver, and kill-switch";
       wantedBy = [ "multi-user.target" ];
-      after = [ "vpnns-anchor.service" ];
+      wants = [ "network-online.target" ];
+      after = [
+        "network-online.target"
+        "vpnns-anchor.service"
+      ];
       requires = [ "vpnns-anchor.service" ];
+      unitConfig.RequiresMountsFor = [
+        cfg.interface.privateKeyFile
+      ]
+      ++ optionals (cfg.peer.presharedKeyFile != null) [ cfg.peer.presharedKeyFile ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        RuntimeDirectory = "vpnns";
+        RuntimeDirectoryMode = "0755";
       };
       script = ''
         set -eu
+
         pid="$(${pkgs.systemd}/bin/systemctl show -p MainPID --value vpnns-anchor.service)"
         if [ -z "$pid" ] || [ "$pid" = "0" ]; then
           echo "vpnns-anchor MainPID unavailable" >&2
@@ -362,20 +398,6 @@ in
 
         ${pkgs.iproute2}/bin/ip netns attach ${cfg.namespace.name} "$pid"
         ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set lo up
-      '';
-    };
-
-    systemd.services.vpnns-link = {
-      description = "Create host-vpn namespace veth link";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "vpnns-attach.service" ];
-      requires = [ "vpnns-attach.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -eu
 
         ${pkgs.iproute2}/bin/ip link del ${cfg.namespace.veth.hostIf} 2>/dev/null || true
 
@@ -387,20 +409,6 @@ in
 
         ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} addr replace ${cfg.namespace.veth.nsAddressIPv4}/30 dev ${cfg.namespace.veth.nsIf}
         ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set ${cfg.namespace.veth.nsIf} up
-      '';
-    };
-
-    systemd.services.vpnns-wg = {
-      description = "Create and configure WireGuard inside vpn namespace";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "vpnns-link.service" ];
-      requires = [ "vpnns-link.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -eu
 
         ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link del ${cfg.interface.name} 2>/dev/null || true
         ${pkgs.iproute2}/bin/ip link del ${cfg.interface.name} 2>/dev/null || true
@@ -433,80 +441,31 @@ in
         ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set ${cfg.interface.name} up
 
         ${concatStringsSep "\n" defaultRouteCmds}
-      '';
-    };
 
-    systemd.services.vpnns-dns = {
-      description = "Write dedicated resolver configuration for VPN namespace services";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "vpnns-link.service" ];
-      requires = [ "vpnns-link.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -eu
         ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname ${cfg.namespace.resolvConfPath})"
-        ${pkgs.coreutils}/bin/cat > ${cfg.namespace.resolvConfPath} <<'EOF'
+        tmp_resolv="$(${pkgs.coreutils}/bin/mktemp "${cfg.namespace.resolvConfPath}.XXXXXX")"
+        ${pkgs.coreutils}/bin/cat > "$tmp_resolv" <<'EOF'
         ${dnsLines}
         options edns0
         EOF
-        ${pkgs.coreutils}/bin/chmod 0444 ${cfg.namespace.resolvConfPath}
-      '';
-    };
+        ${pkgs.coreutils}/bin/chmod 0444 "$tmp_resolv"
+        ${pkgs.coreutils}/bin/mv -f "$tmp_resolv" ${cfg.namespace.resolvConfPath}
 
-    systemd.services.vpnns-firewall = {
-      description = "Load fail-closed nftables rules for VPN namespace";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "vpnns-wg.service"
-        "vpnns-link.service"
-      ];
-      requires = [
-        "vpnns-wg.service"
-        "vpnns-link.service"
-      ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -eu
         ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.nftables}/bin/nft -f - <<'EOF'
         ${nftNamespaceRules}
         EOF
-      '';
-    };
 
-    systemd.services.vpnns-ready = {
-      description = "Verify vpn namespace readiness";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "vpnns-attach.service"
-        "vpnns-link.service"
-        "vpnns-wg.service"
-        "vpnns-dns.service"
-        "vpnns-firewall.service"
-      ];
-      requires = [
-        "vpnns-attach.service"
-        "vpnns-link.service"
-        "vpnns-wg.service"
-        "vpnns-dns.service"
-        "vpnns-firewall.service"
-      ];
-      serviceConfig = {
-        Type = "oneshot";
-      };
-      script = ''
-        set -eu
         [ -e "${namespacePath}" ]
-        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link show ${cfg.interface.name}
-        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} route show default dev ${cfg.interface.name} | ${pkgs.gnugrep}/bin/grep -q .
-        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.wireguard-tools}/bin/wg show ${cfg.interface.name}
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link show ${cfg.interface.name} >/dev/null
+        ${optionalString useTunnelIPv4 ''
+          [ -n "$(${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} route show default dev ${cfg.interface.name})" ]
+        ''}
+        ${optionalString useTunnelIPv6 ''
+          [ -n "$(${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} -6 route show default dev ${cfg.interface.name})" ]
+        ''}
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.wireguard-tools}/bin/wg show ${cfg.interface.name} >/dev/null
         [ -s ${cfg.namespace.resolvConfPath} ]
-        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.nftables}/bin/nft list ruleset | ${pkgs.gnugrep}/bin/grep -q "table inet vpnns"
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.nftables}/bin/nft list table inet vpnns >/dev/null
       '';
     };
   };
