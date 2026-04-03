@@ -1,9 +1,12 @@
 {
   "cSpell.words": [
+    "agenix",
     "bazarr",
     "bindaddress",
     "daddr",
+    "direnv",
     "dport",
+    "envrc",
     "flaresolverr",
     "homelab",
     "iifname",
@@ -17,6 +20,8 @@
     "Networkd",
     "networkmanager",
     "nftables",
+    "nixos",
+    "nixpkgs",
     "nzbget",
     "oifname",
     "pkgs",
