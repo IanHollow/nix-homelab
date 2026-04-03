@@ -15,10 +15,6 @@ let
 
   dataDir = "/var/lib/nzbget";
 
-  bindMount = hostPath: {
-    inherit hostPath;
-    isReadOnly = false;
-  };
 in
 {
   options.homelab.apps.nzbget = {
@@ -26,7 +22,7 @@ in
 
     bindAddress = mkOption {
       type = types.str;
-      default = if cfg.vpn.enable then config.homelab.vpn.container.bindAddress else "127.0.0.1";
+      default = if cfg.vpn.enable then config.homelab.vpn.namespace.bindAddress else "127.0.0.1";
     };
 
     controlPort = mkOption {
@@ -35,7 +31,7 @@ in
     };
 
     vpn = {
-      enable = mkEnableOption "run NZBGet in homelab VPN app stack container";
+      enable = mkEnableOption "run NZBGet in shared homelab VPN namespace";
     };
   };
 
@@ -52,8 +48,9 @@ in
         };
 
         systemd.services.nzbget = {
-          after = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
-          requires = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          after = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
+          requires = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
+          bindsTo = lib.mkIf cfg.vpn.enable [ "vpnns-anchor.service" ];
           serviceConfig = {
             UMask = lib.mkForce "0007";
             NoNewPrivileges = true;
@@ -88,6 +85,10 @@ in
               dataDir
               storage.downloadsDir
             ];
+          }
+          // lib.optionalAttrs cfg.vpn.enable {
+            NetworkNamespacePath = config.homelab.vpn.namespace.path;
+            BindReadOnlyPaths = [ "${config.homelab.vpn.namespace.resolvConfPath}:/etc/resolv.conf" ];
           };
         };
 
@@ -98,17 +99,13 @@ in
       };
     in
     mkIf cfg.enable (
-      if cfg.vpn.enable then
-        {
-          containers.${config.homelab.vpn.container.name} = {
-            bindMounts = {
-              "${dataDir}" = bindMount dataDir;
-              "${storage.downloadsDir}" = bindMount storage.downloadsDir;
-            };
-            config = nzbgetConfig;
-          };
-        }
-      else
+      lib.mkMerge [
         nzbgetConfig
+        (lib.mkIf cfg.vpn.enable {
+          homelab.vpn.namespace.hostIngressPorts = {
+            tcp = [ cfg.controlPort ];
+          };
+        })
+      ]
     );
 }

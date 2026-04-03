@@ -11,11 +11,6 @@ let
 
   user = "prowlarr";
   group = "prowlarr";
-
-  bindMount = hostPath: {
-    inherit hostPath;
-    isReadOnly = false;
-  };
 in
 {
   options.homelab.services.prowlarr = {
@@ -23,7 +18,7 @@ in
 
     bindAddress = mkOption {
       type = types.str;
-      default = if cfg.vpn.enable then config.homelab.vpn.container.bindAddress else "127.0.0.1";
+      default = if cfg.vpn.enable then config.homelab.vpn.namespace.bindAddress else "127.0.0.1";
     };
 
     port = mkOption {
@@ -31,7 +26,7 @@ in
       default = 9696;
     };
 
-    vpn.enable = mkEnableOption "run Prowlarr in homelab VPN app stack container";
+    vpn.enable = mkEnableOption "run Prowlarr in shared homelab VPN namespace";
   };
 
   config =
@@ -52,8 +47,9 @@ in
         };
 
         systemd.services.prowlarr = {
-          after = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
-          requires = lib.mkIf cfg.vpn.enable [ "vpn-ready.service" ];
+          after = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
+          requires = lib.mkIf cfg.vpn.enable [ "vpnns-ready.service" ];
+          bindsTo = lib.mkIf cfg.vpn.enable [ "vpnns-anchor.service" ];
           serviceConfig = {
             DynamicUser = lib.mkForce false;
             User = lib.mkForce user;
@@ -88,6 +84,10 @@ in
             SystemCallErrorNumber = "EPERM";
             UMask = "0007";
             ReadWritePaths = [ config.services.prowlarr.dataDir ];
+          }
+          // lib.optionalAttrs cfg.vpn.enable {
+            NetworkNamespacePath = config.homelab.vpn.namespace.path;
+            BindReadOnlyPaths = [ "${config.homelab.vpn.namespace.resolvConfPath}:/etc/resolv.conf" ];
           };
         };
 
@@ -95,16 +95,13 @@ in
       };
     in
     mkIf cfg.enable (
-      if cfg.vpn.enable then
-        {
-          containers.${config.homelab.vpn.container.name} = {
-            bindMounts = {
-              "${config.services.prowlarr.dataDir}" = bindMount config.services.prowlarr.dataDir;
-            };
-            config = prowlarrConfig;
-          };
-        }
-      else
+      lib.mkMerge [
         prowlarrConfig
+        (lib.mkIf cfg.vpn.enable {
+          homelab.vpn.namespace.hostIngressPorts = {
+            tcp = [ cfg.port ];
+          };
+        })
+      ]
     );
 }

@@ -7,41 +7,25 @@
 let
   inherit (lib)
     any
+    concatMapStringsSep
     concatStringsSep
     hasInfix
     hasPrefix
     hasSuffix
-    mkAfter
-    mkDefault
     mkEnableOption
     mkIf
     mkOption
-    optionalAttrs
-    optionals
     optionalString
+    optionals
     removePrefix
     removeSuffix
     types
-    unique
     ;
 
   cfg = config.homelab.vpn;
 
   useTunnelIPv4 = cfg.interface.addressIPv4 != null;
   useTunnelIPv6 = cfg.interface.addressIPv6 != null;
-
-  family =
-    if useTunnelIPv4 && useTunnelIPv6 then
-      "both"
-    else if useTunnelIPv4 then
-      "ipv4"
-    else if useTunnelIPv6 then
-      "ipv6"
-    else
-      throw "addressIPv4 and addressIPv6 cannot both be null";
-
-  useOuterIPv4 = cfg.container.hostAddressIPv4 != null && cfg.container.localAddressIPv4 != null;
-  useOuterIPv6 = cfg.container.hostAddressIPv6 != null && cfg.container.localAddressIPv6 != null;
 
   endpointHostRaw = if cfg.peer.endpointHost == null then "" else cfg.peer.endpointHost;
 
@@ -65,28 +49,76 @@ let
     else
       "${endpointHost}:${toString cfg.peer.endpointPort}";
 
-  wgAddresses =
-    optionals useTunnelIPv4 [ "${cfg.interface.addressIPv4}/32" ]
-    ++ optionals useTunnelIPv6 [ "${cfg.interface.addressIPv6}/128" ];
-
-  peerAllowedIPs = optionals useTunnelIPv4 [ "0.0.0.0/0" ] ++ optionals useTunnelIPv6 [ "::/0" ];
-
   dnsHasIPv6 = any (s: hasInfix ":" s) cfg.interface.dns;
   dnsHasIPv4 = any (s: !(hasInfix ":" s)) cfg.interface.dns;
 
-  inboundTcp = unique cfg.inboundPorts.tcp;
-  inboundUdp = unique cfg.inboundPorts.udp;
+  inboundTcp = lib.unique cfg.inboundPorts.tcp;
+  inboundUdp = lib.unique cfg.inboundPorts.udp;
+  hostIngressTcp = lib.unique cfg.namespace.hostIngressPorts.tcp;
+  hostIngressUdp = lib.unique cfg.namespace.hostIngressPorts.udp;
+
+  namespacePath = "/run/netns/${cfg.namespace.name}";
+  bindAddress = cfg.namespace.veth.nsAddressIPv4;
+
+  dnsLines = concatMapStringsSep "\n" (dnsIp: "nameserver ${dnsIp}") cfg.interface.dns;
 
   renderSet = values: "{ ${concatStringsSep ", " values} }";
 
-  readOnlyBindMount = hostPath: {
-    inherit hostPath;
-    isReadOnly = true;
-  };
+  wgAddressCmds =
+    optionals useTunnelIPv4 [
+      "${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} address replace ${cfg.interface.addressIPv4}/32 dev ${cfg.interface.name}"
+    ]
+    ++ optionals useTunnelIPv6 [
+      "${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} address replace ${cfg.interface.addressIPv6}/128 dev ${cfg.interface.name}"
+    ];
+
+  defaultRouteCmds =
+    optionals useTunnelIPv4 [
+      "${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} route replace default dev ${cfg.interface.name}"
+    ]
+    ++ optionals useTunnelIPv6 [
+      "${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} -6 route replace default dev ${cfg.interface.name}"
+    ];
+
+  nftNamespaceRules = ''
+    flush ruleset
+
+    table inet vpnns {
+      chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+        ct state established,related accept
+
+        ${optionalString (hostIngressTcp != [ ])
+          "iifname \"${cfg.namespace.veth.nsIf}\" ip saddr ${cfg.namespace.veth.hostAddressIPv4} tcp dport ${renderSet (map toString hostIngressTcp)} accept"
+        }
+        ${optionalString (hostIngressUdp != [ ])
+          "iifname \"${cfg.namespace.veth.nsIf}\" ip saddr ${cfg.namespace.veth.hostAddressIPv4} udp dport ${renderSet (map toString hostIngressUdp)} accept"
+        }
+
+        ${optionalString (
+          inboundTcp != [ ]
+        ) "iifname \"${cfg.interface.name}\" tcp dport ${renderSet (map toString inboundTcp)} accept"}
+        ${optionalString (
+          inboundUdp != [ ]
+        ) "iifname \"${cfg.interface.name}\" udp dport ${renderSet (map toString inboundUdp)} accept"}
+      }
+
+      chain output {
+        type filter hook output priority filter; policy drop;
+
+        oifname "lo" accept
+        ct state established,related accept
+
+        oifname "${cfg.interface.name}" accept
+      }
+    }
+  '';
 in
 {
   options.homelab.vpn = {
-    enable = mkEnableOption "containerized VPN-routed app stack for selected apps";
+    enable = mkEnableOption "shared netns VPN-routed app stack for selected apps";
 
     uplinkInterface = mkOption {
       type = types.nullOr types.str;
@@ -94,40 +126,70 @@ in
       example = "enp3s0";
     };
 
-    container = {
+    container.bindAddress = mkOption {
+      type = types.str;
+      default = config.homelab.vpn.namespace.bindAddress;
+      readOnly = true;
+      description = "Compatibility alias to homelab.vpn.namespace.bindAddress.";
+    };
+
+    namespace = {
       name = mkOption {
         type = types.str;
-        default = "vpn-media";
+        default = "vpnapps";
       };
 
-      hostAddressIPv4 = mkOption {
-        type = types.nullOr types.str;
-        default = "10.231.0.1";
-      };
-
-      localAddressIPv4 = mkOption {
-        type = types.nullOr types.str;
-        default = "10.231.0.2";
-      };
-
-      hostAddressIPv6 = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-      };
-
-      localAddressIPv6 = mkOption {
-        type = types.nullOr types.str;
-        default = null;
+      path = mkOption {
+        type = types.str;
+        default = namespacePath;
+        readOnly = true;
       };
 
       bindAddress = mkOption {
         type = types.str;
-        default =
-          if cfg.container.localAddressIPv4 != null then
-            cfg.container.localAddressIPv4
-          else
-            cfg.container.localAddressIPv6;
+        default = bindAddress;
         readOnly = true;
+      };
+
+      resolvConfPath = mkOption {
+        type = types.str;
+        default = "/run/vpnns/resolv.conf";
+      };
+
+      veth = {
+        hostIf = mkOption {
+          type = types.str;
+          default = "ve-vpn-host";
+        };
+
+        nsIf = mkOption {
+          type = types.str;
+          default = "ve-vpn-ns";
+        };
+
+        hostAddressIPv4 = mkOption {
+          type = types.str;
+          default = "10.231.0.1";
+        };
+
+        nsAddressIPv4 = mkOption {
+          type = types.str;
+          default = "10.231.0.2";
+        };
+      };
+
+      hostIngressPorts = {
+        tcp = mkOption {
+          type = types.listOf types.port;
+          default = [ ];
+          description = "TCP ports allowed from host veth into protected namespace services.";
+        };
+
+        udp = mkOption {
+          type = types.listOf types.port;
+          default = [ ];
+          description = "UDP ports allowed from host veth into protected namespace services.";
+        };
       };
     };
 
@@ -216,10 +278,6 @@ in
         message = "At least one of homelab.vpn.interface.addressIPv4/addressIPv6 must be set.";
       }
       {
-        assertion = useOuterIPv4 || useOuterIPv6;
-        message = "At least one container veth family must be configured.";
-      }
-      {
         assertion = cfg.peer.publicKey != null;
         message = "homelab.vpn.peer.publicKey must be set.";
       }
@@ -240,14 +298,6 @@ in
         message = "Tunnel is IPv6-only, so do not configure IPv4 DNS servers.";
       }
       {
-        assertion = endpointHost == "" || !endpointHostIsIPv6 || useOuterIPv6;
-        message = "WireGuard endpointHost is IPv6, but container veth IPv6 is not configured.";
-      }
-      {
-        assertion = endpointHost == "" || endpointHostIsIPv6 || useOuterIPv4;
-        message = "WireGuard endpointHost is IPv4, but container veth IPv4 is not configured.";
-      }
-      {
         assertion = cfg.interface.privateKeyFile != null;
         message = "homelab.vpn.interface.privateKeyFile must be set.";
       }
@@ -265,184 +315,199 @@ in
       }
     ];
 
-    boot.enableContainers = true;
-    virtualisation.containers.enable = true;
-
-    networking.networkmanager.unmanaged = mkIf config.networking.networkmanager.enable (mkAfter [
-      "interface-name:ve-*"
-    ]);
-
-    networking.nat = {
-      enable = true;
-      internalInterfaces = lib.mkAfter [ "ve-${cfg.container.name}" ];
-      externalInterface = mkDefault cfg.uplinkInterface;
-      enableIPv6 = mkDefault useOuterIPv6;
-    };
-
     systemd.tmpfiles.rules =
       optionals (cfg.interface.privateKeyFile != null) [
-        "z ${cfg.interface.privateKeyFile} 0640 root systemd-network - -"
+        "z ${cfg.interface.privateKeyFile} 0640 root root - -"
       ]
       ++ optionals (cfg.peer.presharedKeyFile != null) [
-        "z ${cfg.peer.presharedKeyFile} 0640 root systemd-network - -"
+        "z ${cfg.peer.presharedKeyFile} 0640 root root - -"
+      ]
+      ++ [
+        "d /run/netns 0755 root root - -"
+        "d /run/vpnns 0755 root root - -"
       ];
 
-    containers.${cfg.container.name} = {
-      autoStart = true;
-      privateNetwork = true;
-
-      hostAddress = mkIf useOuterIPv4 cfg.container.hostAddressIPv4;
-      localAddress = mkIf useOuterIPv4 cfg.container.localAddressIPv4;
-      hostAddress6 = mkIf useOuterIPv6 cfg.container.hostAddressIPv6;
-      localAddress6 = mkIf useOuterIPv6 cfg.container.localAddressIPv6;
-
-      bindMounts =
-        { }
-        // optionalAttrs (cfg.interface.privateKeyFile != null) {
-          "${cfg.interface.privateKeyFile}" = readOnlyBindMount cfg.interface.privateKeyFile;
-        }
-        // optionalAttrs (cfg.peer.presharedKeyFile != null) {
-          "${cfg.peer.presharedKeyFile}" = readOnlyBindMount cfg.peer.presharedKeyFile;
-        };
-
-      config = {
-        system.stateVersion = config.system.stateVersion;
-
-        networking.useHostResolvConf = false;
-        networking.enableIPv6 = useTunnelIPv6 || useOuterIPv6;
-
-        networking.defaultGateway = mkIf useOuterIPv4 cfg.container.hostAddressIPv4;
-        networking.defaultGateway6 = mkIf useOuterIPv6 {
-          address = cfg.container.hostAddressIPv6;
-          interface = "eth0";
-        };
-
-        networking.nftables.enable = true;
-        networking.firewall.enable = false;
-
-        boot.kernel.sysctl."net.ipv4.conf.all.src_valid_mark" = 1;
-
-        systemd.network.enable = true;
-        services.resolved.enable = true;
-
-        systemd.services.vpn-ready = {
-          description = "Wait for ${cfg.interface.name} VPN readiness";
-          after = [ "systemd-networkd.service" ];
-          requires = [ "systemd-networkd.service" ];
-          wantedBy = [ "multi-user.target" ];
-          serviceConfig = {
-            Type = "oneshot";
-          };
-          script = ''
-            set -eu
-            ${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --interface=${cfg.interface.name} --timeout=30
-            ${optionalString useTunnelIPv4 ''
-              route_line_v4="$(${pkgs.iproute2}/bin/ip -o -4 route show table 51820 default dev ${cfg.interface.name})"
-              [ -n "$route_line_v4" ]
-            ''}
-            ${optionalString useTunnelIPv6 ''
-              route_line_v6="$(${pkgs.iproute2}/bin/ip -o -6 route show table 51820 default dev ${cfg.interface.name})"
-              [ -n "$route_line_v6" ]
-            ''}
-          '';
-        };
-
-        systemd.network.config.routeTables.vpnapps = 51820;
-
-        systemd.network.netdevs."50-${cfg.interface.name}" = {
-          netdevConfig = {
-            Name = cfg.interface.name;
-            Kind = "wireguard";
-            MTUBytes = cfg.interface.mtu;
-          };
-
-          wireguardConfig = {
-            FirewallMark = 51820;
-          }
-          // optionalAttrs (cfg.interface.privateKeyFile != null) {
-            PrivateKeyFile = cfg.interface.privateKeyFile;
-          };
-
-          wireguardPeers = optionals (cfg.peer.publicKey != null && endpointHostIsIpLiteral) [
-            (
-              {
-                PublicKey = cfg.peer.publicKey;
-                Endpoint = endpoint;
-                AllowedIPs = peerAllowedIPs;
-                RouteTable = 51820;
-                PersistentKeepalive = cfg.peer.persistentKeepalive;
-              }
-              // optionalAttrs (cfg.peer.presharedKeyFile != null) {
-                PresharedKeyFile = cfg.peer.presharedKeyFile;
-              }
-            )
-          ];
-        };
-
-        systemd.network.networks."50-${cfg.interface.name}" = {
-          matchConfig.Name = cfg.interface.name;
-          address = wgAddresses;
-          inherit (cfg.interface) dns;
-          domains = [ "~." ];
-
-          networkConfig = {
-            ConfigureWithoutCarrier = true;
-            IgnoreCarrierLoss = true;
-            DNSDefaultRoute = true;
-          };
-
-          routingPolicyRules = [
-            {
-              Family = family;
-              Table = "main";
-              SuppressPrefixLength = 0;
-              Priority = 10000;
-            }
-            {
-              Family = family;
-              FirewallMark = 51820;
-              InvertRule = true;
-              Table = 51820;
-              Priority = 10001;
-            }
-          ];
-        };
-
-        networking.nftables.tables.vpn-killswitch = {
-          family = "inet";
-          content = ''
-            chain input {
-              type filter hook input priority filter; policy drop;
-
-              iifname "lo" accept
-              ct state established,related accept
-
-              ${optionalString useOuterIPv4 ''
-                iifname "eth0" ip saddr ${cfg.container.hostAddressIPv4} accept
-              ''}
-              ${optionalString useOuterIPv6 ''
-                iifname "eth0" ip6 saddr ${cfg.container.hostAddressIPv6} accept
-              ''}
-              ${optionalString (inboundTcp != [ ]) ''
-                iifname "${cfg.interface.name}" tcp dport ${renderSet (map toString inboundTcp)} accept
-              ''}
-              ${optionalString (inboundUdp != [ ]) ''
-                iifname "${cfg.interface.name}" udp dport ${renderSet (map toString inboundUdp)} accept
-              ''}
-            }
-
-            chain output {
-              type filter hook output priority filter; policy drop;
-
-              oifname "lo" accept
-              ct state established,related accept
-
-              oifname "eth0" meta mark 51820 accept
-              oifname "${cfg.interface.name}" accept
-            }
-          '';
-        };
+    systemd.services.vpnns-anchor = {
+      description = "Namespace owner for VPN-protected services";
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        PrivateNetwork = true;
       };
+    };
+
+    systemd.services.vpnns-attach = {
+      description = "Attach anchor namespace to /run/netns";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "vpnns-anchor.service" ];
+      requires = [ "vpnns-anchor.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+        pid="$(${pkgs.systemd}/bin/systemctl show -p MainPID --value vpnns-anchor.service)"
+        if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+          echo "vpnns-anchor MainPID unavailable" >&2
+          exit 1
+        fi
+
+        ${pkgs.coreutils}/bin/mkdir -p /run/netns
+
+        if [ -e "${namespacePath}" ]; then
+          ${pkgs.iproute2}/bin/ip netns del ${cfg.namespace.name} || true
+        fi
+
+        ${pkgs.iproute2}/bin/ip netns attach ${cfg.namespace.name} "$pid"
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set lo up
+      '';
+    };
+
+    systemd.services.vpnns-link = {
+      description = "Create host-vpn namespace veth link";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "vpnns-attach.service" ];
+      requires = [ "vpnns-attach.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+
+        ${pkgs.iproute2}/bin/ip link del ${cfg.namespace.veth.hostIf} 2>/dev/null || true
+
+        ${pkgs.iproute2}/bin/ip link add ${cfg.namespace.veth.hostIf} type veth peer name ${cfg.namespace.veth.nsIf}
+        ${pkgs.iproute2}/bin/ip link set ${cfg.namespace.veth.nsIf} netns ${cfg.namespace.name}
+
+        ${pkgs.iproute2}/bin/ip addr replace ${cfg.namespace.veth.hostAddressIPv4}/30 dev ${cfg.namespace.veth.hostIf}
+        ${pkgs.iproute2}/bin/ip link set ${cfg.namespace.veth.hostIf} up
+
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} addr replace ${cfg.namespace.veth.nsAddressIPv4}/30 dev ${cfg.namespace.veth.nsIf}
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set ${cfg.namespace.veth.nsIf} up
+      '';
+    };
+
+    systemd.services.vpnns-wg = {
+      description = "Create and configure WireGuard inside vpn namespace";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "vpnns-link.service" ];
+      requires = [ "vpnns-link.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link del ${cfg.interface.name} 2>/dev/null || true
+        ${pkgs.iproute2}/bin/ip link del ${cfg.interface.name} 2>/dev/null || true
+
+        ${pkgs.iproute2}/bin/ip link add ${cfg.interface.name} type wireguard
+        ${pkgs.iproute2}/bin/ip link set ${cfg.interface.name} netns ${cfg.namespace.name}
+
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.wireguard-tools}/bin/wg set ${cfg.interface.name} \
+          private-key ${cfg.interface.privateKeyFile} \
+          listen-port 0 \
+          peer ${cfg.peer.publicKey} \
+          endpoint ${endpoint} \
+          persistent-keepalive ${toString cfg.peer.persistentKeepalive} \
+          allowed-ips ${
+            if useTunnelIPv4 && useTunnelIPv6 then
+              "0.0.0.0/0,::/0"
+            else if useTunnelIPv4 then
+              "0.0.0.0/0"
+            else
+              "::/0"
+          }
+
+        ${optionalString (cfg.peer.presharedKeyFile != null) ''
+          ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.wireguard-tools}/bin/wg set ${cfg.interface.name} preshared-key ${cfg.peer.presharedKeyFile}
+        ''}
+
+        ${concatStringsSep "\n" wgAddressCmds}
+
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set ${cfg.interface.name} mtu ${toString cfg.interface.mtu}
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link set ${cfg.interface.name} up
+
+        ${concatStringsSep "\n" defaultRouteCmds}
+      '';
+    };
+
+    systemd.services.vpnns-dns = {
+      description = "Write dedicated resolver configuration for VPN namespace services";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "vpnns-link.service" ];
+      requires = [ "vpnns-link.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+        ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname ${cfg.namespace.resolvConfPath})"
+        ${pkgs.coreutils}/bin/cat > ${cfg.namespace.resolvConfPath} <<'EOF'
+        ${dnsLines}
+        options edns0
+        EOF
+        ${pkgs.coreutils}/bin/chmod 0444 ${cfg.namespace.resolvConfPath}
+      '';
+    };
+
+    systemd.services.vpnns-firewall = {
+      description = "Load fail-closed nftables rules for VPN namespace";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "vpnns-wg.service"
+        "vpnns-link.service"
+      ];
+      requires = [
+        "vpnns-wg.service"
+        "vpnns-link.service"
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.nftables}/bin/nft -f - <<'EOF'
+        ${nftNamespaceRules}
+        EOF
+      '';
+    };
+
+    systemd.services.vpnns-ready = {
+      description = "Verify vpn namespace readiness";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "vpnns-attach.service"
+        "vpnns-link.service"
+        "vpnns-wg.service"
+        "vpnns-dns.service"
+        "vpnns-firewall.service"
+      ];
+      requires = [
+        "vpnns-attach.service"
+        "vpnns-link.service"
+        "vpnns-wg.service"
+        "vpnns-dns.service"
+        "vpnns-firewall.service"
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+      };
+      script = ''
+        set -eu
+        [ -e "${namespacePath}" ]
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} link show ${cfg.interface.name}
+        ${pkgs.iproute2}/bin/ip -n ${cfg.namespace.name} route show default dev ${cfg.interface.name} | ${pkgs.gnugrep}/bin/grep -q .
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.wireguard-tools}/bin/wg show ${cfg.interface.name}
+        [ -s ${cfg.namespace.resolvConfPath} ]
+        ${pkgs.iproute2}/bin/ip netns exec ${cfg.namespace.name} ${pkgs.nftables}/bin/nft list ruleset | ${pkgs.gnugrep}/bin/grep -q "table inet vpnns"
+      '';
     };
   };
 }
